@@ -187,8 +187,6 @@ func (sum *Sum) handleCoordMessage(msg middleware.Message, ack func(), nack func
 		return
 	}
 
-	// TODO: Ver que pasa cuando me llegan mensajes que YO mande, se tienen que descartar
-
 	if coordMsg.CoordinatorId == sum.id {
 		sum.coordinatorHandler(coordMsg)
 	} else {

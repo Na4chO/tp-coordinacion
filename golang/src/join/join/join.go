@@ -115,6 +115,9 @@ func (join *Join) updateCLientFinalTop(clientId uint64, partialTop []fruititem.F
 
 func (join *Join) sendClientFinalTop(clientId uint64) error {
 	finalTop, _ := join.clientFinalTop[clientId]
+	if finalTop == nil {
+		finalTop = []fruititem.FruitItem{}
+	}
 
 	message, err := inner.SerializeMessage(inner.MessageBody{
 		ClientId: clientId,
