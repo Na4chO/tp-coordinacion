@@ -2,6 +2,10 @@ package join
 
 import (
 	"log/slog"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -27,6 +31,7 @@ type Join struct {
 	clientFinalTop           map[uint64][]fruititem.FruitItem
 	expectedPartialTopAmount int
 	clientPartialTopAmount   map[uint64]int
+	running                  atomic.Bool
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -43,20 +48,31 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		return nil, err
 	}
 
-	return &Join{
+	join := Join{
 		inputQueue:               inputQueue,
 		outputQueue:              outputQueue,
 		topSize:                  config.TopSize,
 		clientFinalTop:           map[uint64][]fruititem.FruitItem{},
 		expectedPartialTopAmount: config.AggregationAmount,
 		clientPartialTopAmount:   map[uint64]int{},
-	}, nil
+	}
+	join.running.Store(true)
+	return &join, nil
 }
 
-func (join *Join) Run() {
-	join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+func (join *Join) Run() error {
+	go join.handleSignals()
+
+	err := join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		join.handleMessage(msg, ack, nack)
 	})
+
+	join.closeMiddlewares()
+
+	if join.running.Load() {
+		return err
+	}
+	return nil
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) error {
@@ -133,4 +149,19 @@ func (join *Join) sendClientFinalTop(clientId uint64) error {
 	delete(join.clientFinalTop, clientId)
 	delete(join.clientPartialTopAmount, clientId)
 	return nil
+}
+
+func (join *Join) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	join.running.Store(false)
+	_ = join.inputQueue.StopConsuming()
+}
+
+func (join *Join) closeMiddlewares() {
+	_ = join.inputQueue.StopConsuming()
+	_ = join.inputQueue.Close()
+	_ = join.outputQueue.Close()
 }

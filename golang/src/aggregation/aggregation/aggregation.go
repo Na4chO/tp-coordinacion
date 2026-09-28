@@ -3,7 +3,11 @@ package aggregation
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sort"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -29,6 +33,7 @@ type Aggregation struct {
 	topSize            int
 	expectedEOFAmount  int
 	clientEOFAmount    map[uint64]int
+	running            atomic.Bool
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -46,20 +51,31 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		return nil, err
 	}
 
-	return &Aggregation{
+	aggregation := Aggregation{
 		outputQueue:        outputQueue,
 		inputExchange:      inputExchange,
 		clientFruitItemMap: map[uint64]map[string]fruititem.FruitItem{},
 		topSize:            config.TopSize,
 		expectedEOFAmount:  config.SumAmount,
 		clientEOFAmount:    map[uint64]int{},
-	}, nil
+	}
+	aggregation.running.Store(true)
+	return &aggregation, nil
 }
 
-func (aggregation *Aggregation) Run() {
-	aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+func (aggregation *Aggregation) Run() error {
+	go aggregation.handleSignals()
+
+	err := aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		aggregation.handleMessage(msg, ack, nack)
 	})
+
+	aggregation.closeMiddlewares()
+
+	if aggregation.running.Load() {
+		return err
+	}
+	return nil
 }
 
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -139,4 +155,19 @@ func (aggregation *Aggregation) sendClientTop(clientId uint64, fruitTopRecords [
 		return err
 	}
 	return aggregation.outputQueue.Send(*message)
+}
+
+func (aggregation *Aggregation) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	aggregation.running.Store(false)
+	_ = aggregation.inputExchange.StopConsuming()
+}
+
+func (aggregation *Aggregation) closeMiddlewares() {
+	_ = aggregation.inputExchange.StopConsuming()
+	_ = aggregation.inputExchange.Close()
+	_ = aggregation.outputQueue.Close()
 }

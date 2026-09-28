@@ -4,7 +4,11 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -34,6 +38,7 @@ type Sum struct {
 	clientRemainingMsg  map[uint64]uint64
 	clientNewMsg        map[uint64]uint64
 	clientCoordinatorId map[uint64]int
+	running             atomic.Bool
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -67,7 +72,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	return &Sum{
+	sum := Sum{
 		id:                  config.Id,
 		inputQueue:          inputQueue,
 		outputExchange:      outputExchange,
@@ -79,17 +84,32 @@ func NewSum(config SumConfig) (*Sum, error) {
 		clientRemainingMsg:  map[uint64]uint64{},
 		clientNewMsg:        map[uint64]uint64{},
 		clientCoordinatorId: map[uint64]int{},
-	}, nil
+	}
+	sum.running.Store(true)
+	return &sum, nil
 }
 
-func (sum *Sum) Run() {
-	go sum.coordExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleCoordMessage(msg, ack, nack)
-	})
+func (sum *Sum) Run() error {
+	go func() {
+		if err := sum.coordExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			sum.handleCoordMessage(msg, ack, nack)
+		}); err != nil && sum.running.Load() {
+			slog.Error("Coordination consumer stopped with error", "err", err)
+		}
+	}()
 
-	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	go sum.handleSignals()
+
+	err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
+
+	sum.closeMiddlewares()
+
+	if sum.running.Load() {
+		return err
+	}
+	return nil
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -351,4 +371,22 @@ func fruitGroup(fruit string, groups int) int {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(fruit))
 	return int(h.Sum64() % uint64(groups))
+}
+
+func (sum *Sum) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	sum.running.Store(false)
+	_ = sum.inputQueue.StopConsuming()
+	_ = sum.coordExchange.StopConsuming()
+}
+
+func (sum *Sum) closeMiddlewares() {
+	_ = sum.inputQueue.StopConsuming()
+	_ = sum.inputQueue.Close()
+	_ = sum.coordExchange.StopConsuming()
+	_ = sum.coordExchange.Close()
+	_ = sum.outputExchange.Close()
 }

@@ -6,7 +6,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/7574-sistemas-distribuidos/tp-coordinacion/sum"
+	"github.com/7574-sistemas-distribuidos/tp-coordinacion/sum/sum"
 )
 
 func loadConfig() (sum.SumConfig, error) {
@@ -75,7 +75,10 @@ func run() int {
 		return 1
 	}
 
-	server.Run()
+	if err := server.Run(); err != nil {
+		slog.Error("Sum stopped with error", "err", err)
+		return 1
+	}
 	return 0
 }
 

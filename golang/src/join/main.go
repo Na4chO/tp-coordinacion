@@ -6,7 +6,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/7574-sistemas-distribuidos/tp-coordinacion/join"
+	"github.com/7574-sistemas-distribuidos/tp-coordinacion/join/join"
 )
 
 func loadConfig() (join.JoinConfig, error) {
@@ -81,7 +81,10 @@ func run() int {
 		return 1
 	}
 
-	server.Run()
+	if err := server.Run(); err != nil {
+		slog.Error("Join stopped with error", "err", err)
+		return 1
+	}
 	return 0
 }
 
