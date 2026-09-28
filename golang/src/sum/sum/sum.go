@@ -26,19 +26,26 @@ type SumConfig struct {
 	AggregationPrefix string
 }
 
+type clientState struct {
+	fruitItems    map[string]fruititem.FruitItem
+	newMsg        uint64
+	remainingMsg  uint64
+	coordinatorId int
+	isCoordinator bool
+	isParticipant bool
+}
+
 type Sum struct {
-	id                  int
-	inputQueue          middleware.Middleware
-	outputExchange      middleware.Router
-	coordExchange       middleware.Router
-	aggregationPrefix   string
-	aggregationAmount   int
-	stateLock           sync.Mutex
-	clientFruitItemMap  map[uint64]map[string]fruititem.FruitItem
-	clientRemainingMsg  map[uint64]uint64
-	clientNewMsg        map[uint64]uint64
-	clientCoordinatorId map[uint64]int
-	running             atomic.Bool
+	id                int
+	inputQueue        middleware.Middleware
+	outputExchange    middleware.Router
+	coordExchange     middleware.Router
+	aggregationPrefix string
+	aggregationAmount int
+	sumAmount         int
+	stateLock         sync.Mutex
+	clientStates      map[uint64]*clientState
+	running           atomic.Bool
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -73,17 +80,15 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}
 
 	sum := Sum{
-		id:                  config.Id,
-		inputQueue:          inputQueue,
-		outputExchange:      outputExchange,
-		coordExchange:       coordExchange,
-		aggregationPrefix:   config.AggregationPrefix,
-		aggregationAmount:   config.AggregationAmount,
-		stateLock:           sync.Mutex{},
-		clientFruitItemMap:  map[uint64]map[string]fruititem.FruitItem{},
-		clientRemainingMsg:  map[uint64]uint64{},
-		clientNewMsg:        map[uint64]uint64{},
-		clientCoordinatorId: map[uint64]int{},
+		id:                config.Id,
+		inputQueue:        inputQueue,
+		outputExchange:    outputExchange,
+		coordExchange:     coordExchange,
+		aggregationPrefix: config.AggregationPrefix,
+		aggregationAmount: config.AggregationAmount,
+		sumAmount:         config.SumAmount,
+		stateLock:         sync.Mutex{},
+		clientStates:      map[uint64]*clientState{},
 	}
 	sum.running.Store(true)
 	return &sum, nil
@@ -137,8 +142,10 @@ func (sum *Sum) handleEndOfRecordMessage(msgBody *inner.MessageBody) error {
 	slog.Info("Received End Of Records message")
 
 	sum.stateLock.Lock()
-	sum.clientRemainingMsg[msgBody.ClientId] = msgBody.Total - sum.clientNewMsg[msgBody.ClientId]
-	delete(sum.clientNewMsg, msgBody.ClientId)
+	state := sum.clientStateFor(msgBody.ClientId)
+	state.remainingMsg = msgBody.Total - state.newMsg
+	state.newMsg = 0
+	state.isCoordinator = true
 	sum.stateLock.Unlock()
 
 	if err := sum.sendClientRecords(msgBody.ClientId); err != nil {
@@ -149,6 +156,12 @@ func (sum *Sum) handleEndOfRecordMessage(msgBody *inner.MessageBody) error {
 	if err := sum.sendEndOfTheRecordsMessage(msgBody.ClientId); err != nil {
 		slog.Error("While sending end of the-records message", "err", err)
 		return err
+	}
+
+	if sum.sumAmount == 1 {
+		sum.stateLock.Lock()
+		delete(sum.clientStates, msgBody.ClientId)
+		sum.stateLock.Unlock()
 	}
 
 	message := inner.CoordinationMessage{Type: inner.Coordinator, ClientId: msgBody.ClientId, CoordinatorId: sum.id}
@@ -162,24 +175,22 @@ func (sum *Sum) handleEndOfRecordMessage(msgBody *inner.MessageBody) error {
 
 func (sum *Sum) handleDataMessage(msgBody *inner.MessageBody) error {
 	sum.stateLock.Lock()
-	if _, ok := sum.clientFruitItemMap[msgBody.ClientId]; !ok {
-		sum.clientFruitItemMap[msgBody.ClientId] = map[string]fruititem.FruitItem{}
-	}
+	state := sum.clientStateFor(msgBody.ClientId)
 
 	for _, fruitRecord := range msgBody.Records {
-		_, ok := sum.clientFruitItemMap[msgBody.ClientId][fruitRecord.Fruit]
-		if ok {
-			sum.clientFruitItemMap[msgBody.ClientId][fruitRecord.Fruit] = sum.clientFruitItemMap[msgBody.ClientId][fruitRecord.Fruit].Sum(fruitRecord)
+		if current, ok := state.fruitItems[fruitRecord.Fruit]; ok {
+			state.fruitItems[fruitRecord.Fruit] = current.Sum(fruitRecord)
 		} else {
-			sum.clientFruitItemMap[msgBody.ClientId][fruitRecord.Fruit] = fruitRecord
+			state.fruitItems[fruitRecord.Fruit] = fruitRecord
 		}
 	}
 
-	sum.clientNewMsg[msgBody.ClientId]++
-	coordinatorId, isParticipant := sum.clientCoordinatorId[msgBody.ClientId]
-	processed := sum.clientNewMsg[msgBody.ClientId]
+	state.newMsg++
+	coordinatorId := state.coordinatorId
+	isParticipant := state.isParticipant
+	processed := state.newMsg
 	if isParticipant {
-		sum.clientNewMsg[msgBody.ClientId] = 0
+		state.newMsg = 0
 	}
 	sum.stateLock.Unlock()
 
@@ -222,16 +233,16 @@ func (sum *Sum) coordinatorHandler(msg *inner.CoordinationMessage) error {
 	}
 
 	sum.stateLock.Lock()
-	_, ok := sum.clientRemainingMsg[msg.ClientId]
-	if !ok {
+	state, ok := sum.clientStates[msg.ClientId]
+	if !ok || !state.isCoordinator {
 		sum.stateLock.Unlock()
 		slog.Warn("Messages to process not found for this client", "clientId", msg.ClientId)
 		return nil
 	}
-	sum.clientRemainingMsg[msg.ClientId] -= msg.Processed
-	shouldEnd := sum.clientRemainingMsg[msg.ClientId] == 0
+	state.remainingMsg -= msg.Processed
+	shouldEnd := state.remainingMsg == 0
 	if shouldEnd {
-		delete(sum.clientRemainingMsg, msg.ClientId)
+		delete(sum.clientStates, msg.ClientId)
 	}
 	sum.stateLock.Unlock()
 
@@ -253,9 +264,11 @@ func (sum *Sum) coordinatorHandler(msg *inner.CoordinationMessage) error {
 func (sum *Sum) participantHandler(msg *inner.CoordinationMessage) error {
 	if msg.Type == inner.Coordinator {
 		sum.stateLock.Lock()
-		sum.clientCoordinatorId[msg.ClientId] = msg.CoordinatorId
-		processed := sum.clientNewMsg[msg.ClientId]
-		sum.clientNewMsg[msg.ClientId] = 0
+		state := sum.clientStateFor(msg.ClientId)
+		state.isParticipant = true
+		state.coordinatorId = msg.CoordinatorId
+		processed := state.newMsg
+		state.newMsg = 0
 		sum.stateLock.Unlock()
 
 		message := inner.CoordinationMessage{
@@ -270,19 +283,18 @@ func (sum *Sum) participantHandler(msg *inner.CoordinationMessage) error {
 			return err
 		}
 	} else if msg.Type == inner.End {
-		sum.stateLock.Lock()
-		delete(sum.clientNewMsg, msg.ClientId)
-		delete(sum.clientCoordinatorId, msg.ClientId)
-		sum.stateLock.Unlock()
-
 		if err := sum.sendClientRecords(msg.ClientId); err != nil {
 			slog.Error("While sending client records", "err", err)
 			return err
 		}
 		if err := sum.sendEndOfTheRecordsMessage(msg.ClientId); err != nil {
-			slog.Error("While sending end of the-records message", "err", err)
+			slog.Error("While sending end of-the-records message", "err", err)
 			return err
 		}
+
+		sum.stateLock.Lock()
+		delete(sum.clientStates, msg.ClientId)
+		sum.stateLock.Unlock()
 	}
 
 	return nil
@@ -306,16 +318,16 @@ func (sum *Sum) takeClientRecords(clientId uint64) []fruititem.FruitItem {
 	sum.stateLock.Lock()
 	defer sum.stateLock.Unlock()
 
-	fruitItemMap, ok := sum.clientFruitItemMap[clientId]
+	state, ok := sum.clientStates[clientId]
 	if !ok {
 		return nil
 	}
-	delete(sum.clientFruitItemMap, clientId)
 
-	records := make([]fruititem.FruitItem, 0, len(fruitItemMap))
-	for _, item := range fruitItemMap {
+	records := make([]fruititem.FruitItem, 0, len(state.fruitItems))
+	for _, item := range state.fruitItems {
 		records = append(records, item)
 	}
+	state.fruitItems = map[string]fruititem.FruitItem{}
 	return records
 }
 
@@ -371,6 +383,15 @@ func fruitGroup(fruit string, groups int) int {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(fruit))
 	return int(h.Sum64() % uint64(groups))
+}
+
+func (sum *Sum) clientStateFor(clientId uint64) *clientState {
+	state, ok := sum.clientStates[clientId]
+	if !ok {
+		state = &clientState{fruitItems: map[string]fruititem.FruitItem{}}
+		sum.clientStates[clientId] = state
+	}
+	return state
 }
 
 func (sum *Sum) handleSignals() {
