@@ -106,9 +106,10 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(msgBody *inner.Message
 
 	fruitTopRecords := aggregation.buildFruitTop(msgBody.ClientId)
 	delete(aggregation.clientFruitItemMap, msgBody.ClientId)
+	delete(aggregation.clientEOFAmount, msgBody.ClientId)
 
 	if err := aggregation.sendClientTop(msgBody.ClientId, fruitTopRecords); err != nil {
-		slog.Debug("While sending top message", "err", err)
+		slog.Error("While sending top message", "err", err)
 		return err
 	}
 
