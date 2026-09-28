@@ -2,6 +2,7 @@ package sum
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 
@@ -22,11 +23,12 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	id             int
-	inputQueue     middleware.Middleware
-	outputExchange middleware.Middleware
-	coordExchange  middleware.Router
-
+	id                  int
+	inputQueue          middleware.Middleware
+	outputExchange      middleware.Router
+	coordExchange       middleware.Router
+	aggregationPrefix   string
+	aggregationAmount   int
 	stateLock           sync.Mutex
 	clientFruitItemMap  map[uint64]map[string]fruititem.FruitItem
 	clientRemainingMsg  map[uint64]uint64
@@ -70,6 +72,8 @@ func NewSum(config SumConfig) (*Sum, error) {
 		inputQueue:          inputQueue,
 		outputExchange:      outputExchange,
 		coordExchange:       coordExchange,
+		aggregationPrefix:   config.AggregationPrefix,
+		aggregationAmount:   config.AggregationAmount,
 		stateLock:           sync.Mutex{},
 		clientFruitItemMap:  map[uint64]map[string]fruititem.FruitItem{},
 		clientRemainingMsg:  map[uint64]uint64{},
@@ -298,15 +302,20 @@ func (sum *Sum) takeClientRecords(clientId uint64) []fruititem.FruitItem {
 }
 
 func (sum *Sum) sendClientRecords(clientId uint64) error {
+	recordsByGroup := map[int][]fruititem.FruitItem{}
 	for _, record := range sum.takeClientRecords(clientId) {
-		message, err := inner.SerializeMessage(inner.MessageBody{
-			ClientId: clientId,
-			Records:  []fruititem.FruitItem{record},
-		})
+		group := fruitGroup(record.Fruit, sum.aggregationAmount)
+		recordsByGroup[group] = append(recordsByGroup[group], record)
+	}
+
+	for group, records := range recordsByGroup {
+		message, err := inner.SerializeMessage(inner.MessageBody{ClientId: clientId, Records: records})
 		if err != nil {
 			return err
 		}
-		if err := sum.outputExchange.Send(*message); err != nil {
+
+		routingKey := fmt.Sprintf("%s_%d", sum.aggregationPrefix, group)
+		if err := sum.outputExchange.SendTo(routingKey, *message); err != nil {
 			return err
 		}
 	}
@@ -338,4 +347,10 @@ func coordRouteKey(id int) string {
 
 func coordBroadcastKey() string {
 	return "coord_broadcast"
+}
+
+func fruitGroup(fruit string, groups int) int {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(fruit))
+	return int(h.Sum64() % uint64(groups))
 }

@@ -27,6 +27,8 @@ type Aggregation struct {
 	inputExchange      middleware.Middleware
 	clientFruitItemMap map[uint64]map[string]fruititem.FruitItem
 	topSize            int
+	expectedEOFAmount  int
+	clientEOFAmount    map[uint64]int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -49,6 +51,8 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 		inputExchange:      inputExchange,
 		clientFruitItemMap: map[uint64]map[string]fruititem.FruitItem{},
 		topSize:            config.TopSize,
+		expectedEOFAmount:  config.SumAmount,
+		clientEOFAmount:    map[uint64]int{},
 	}, nil
 }
 
@@ -79,35 +83,18 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 
 func (aggregation *Aggregation) handleEndOfRecordsMessage(msgBody *inner.MessageBody) error {
 	slog.Info("Received End Of Records message")
+	aggregation.clientEOFAmount[msgBody.ClientId]++
+	if aggregation.clientEOFAmount[msgBody.ClientId] < aggregation.expectedEOFAmount {
+		return nil
+	}
 
 	fruitTopRecords := aggregation.buildFruitTop(msgBody.ClientId)
-	message, err := inner.SerializeMessage(inner.MessageBody{
-		ClientId: msgBody.ClientId,
-		Records:  fruitTopRecords,
-	})
-	if err != nil {
-		slog.Debug("While serializing top message", "err", err)
-		return err
-	}
-	if err := aggregation.outputQueue.Send(*message); err != nil {
+	delete(aggregation.clientFruitItemMap, msgBody.ClientId)
+
+	if err := aggregation.sendClientTop(msgBody.ClientId, fruitTopRecords); err != nil {
 		slog.Debug("While sending top message", "err", err)
 		return err
 	}
-
-	message, err = inner.SerializeMessage(inner.MessageBody{
-		ClientId: msgBody.ClientId,
-		IsEof:    true,
-	})
-	if err != nil {
-		slog.Debug("While serializing EOF message", "err", err)
-		return err
-	}
-	if err := aggregation.outputQueue.Send(*message); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
-	}
-
-	delete(aggregation.clientFruitItemMap, msgBody.ClientId)
 
 	return nil
 }
@@ -141,4 +128,15 @@ func (aggregation *Aggregation) buildFruitTop(clientId uint64) []fruititem.Fruit
 	})
 	finalTopSize := min(aggregation.topSize, len(fruitItems))
 	return fruitItems[:finalTopSize]
+}
+
+func (aggregation *Aggregation) sendClientTop(clientId uint64, fruitTopRecords []fruititem.FruitItem) error {
+	message, err := inner.SerializeMessage(inner.MessageBody{
+		ClientId: clientId,
+		Records:  fruitTopRecords,
+	})
+	if err != nil {
+		return err
+	}
+	return aggregation.outputQueue.Send(*message)
 }
