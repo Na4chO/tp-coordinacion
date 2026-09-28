@@ -3,6 +3,7 @@ package sum
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -21,13 +22,16 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	id                      int
-	inputQueue              middleware.Middleware
-	outputExchange          middleware.Middleware
-	ringInputQueue          middleware.Middleware
-	ringOutputQueue         middleware.Middleware
-	clientFruitItemMap      map[uint64]map[string]fruititem.FruitItem
-	clientProcessedMsgCount map[uint64]uint64
+	id             int
+	inputQueue     middleware.Middleware
+	outputExchange middleware.Middleware
+	coordExchange  middleware.Router
+
+	stateLock           sync.Mutex
+	clientFruitItemMap  map[uint64]map[string]fruititem.FruitItem
+	clientRemainingMsg  map[uint64]uint64
+	clientNewMsg        map[uint64]uint64
+	clientCoordinatorId map[uint64]int
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -49,33 +53,34 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	ringInputQueue, err := middleware.CreateQueueMiddleware(
-		fmt.Sprintf("ring_%s_%d", config.SumPrefix, config.Id),
+	coordExchangeRouteKeys := []string{coordBroadcastKey(), coordRouteKey(config.Id)}
+	coordExchange, err := middleware.CreateExchangeMiddleware(
+		fmt.Sprintf("coord_%s", config.SumPrefix),
+		coordExchangeRouteKeys,
 		connSettings,
 	)
-	ringOutputQueue, err := middleware.CreateQueueMiddleware(
-		fmt.Sprintf("ring_%s_%d", config.SumPrefix, (config.Id+1)%config.SumAmount),
-		connSettings,
-	)
-
 	if err != nil {
+		inputQueue.Close()
+		outputExchange.Close()
 		return nil, err
 	}
 
 	return &Sum{
-		id:                      config.Id,
-		inputQueue:              inputQueue,
-		outputExchange:          outputExchange,
-		ringInputQueue:          ringInputQueue,
-		ringOutputQueue:         ringOutputQueue,
-		clientFruitItemMap:      map[uint64]map[string]fruititem.FruitItem{},
-		clientProcessedMsgCount: map[uint64]uint64{},
+		id:                  config.Id,
+		inputQueue:          inputQueue,
+		outputExchange:      outputExchange,
+		coordExchange:       coordExchange,
+		stateLock:           sync.Mutex{},
+		clientFruitItemMap:  map[uint64]map[string]fruititem.FruitItem{},
+		clientRemainingMsg:  map[uint64]uint64{},
+		clientNewMsg:        map[uint64]uint64{},
+		clientCoordinatorId: map[uint64]int{},
 	}, nil
 }
 
 func (sum *Sum) Run() {
-	go sum.ringInputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleRingMessage(msg, ack, nack)
+	go sum.coordExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+		sum.handleCoordMessage(msg, ack, nack)
 	})
 
 	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
@@ -107,13 +112,24 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 func (sum *Sum) handleEndOfRecordMessage(msgBody *inner.MessageBody) error {
 	slog.Info("Received End Of Records message")
 
-	err := sum.sendRingMessage(&inner.RingMessage{
-		ClientId: msgBody.ClientId,
-		Total:    msgBody.Total,
-	})
+	sum.stateLock.Lock()
+	sum.clientRemainingMsg[msgBody.ClientId] = msgBody.Total - sum.clientNewMsg[msgBody.ClientId]
+	delete(sum.clientNewMsg, msgBody.ClientId)
+	sum.stateLock.Unlock()
 
-	if err != nil {
-		slog.Error("While sending first ring message", "err", err)
+	if err := sum.sendClientRecords(msgBody.ClientId); err != nil {
+		slog.Error("While sending client records", "err", err)
+		return err
+	}
+
+	if err := sum.sendEndOfTheRecordsMessage(msgBody.ClientId); err != nil {
+		slog.Error("While sending end of the-records message", "err", err)
+		return err
+	}
+
+	message := inner.CoordinationMessage{Type: inner.Coordinator, ClientId: msgBody.ClientId, CoordinatorId: sum.id}
+	if err := sum.sendCoordBroadcastMessage(&message); err != nil {
+		slog.Error("While sending Coordinator message", "err", err)
 		return err
 	}
 
@@ -121,6 +137,7 @@ func (sum *Sum) handleEndOfRecordMessage(msgBody *inner.MessageBody) error {
 }
 
 func (sum *Sum) handleDataMessage(msgBody *inner.MessageBody) error {
+	sum.stateLock.Lock()
 	if _, ok := sum.clientFruitItemMap[msgBody.ClientId]; !ok {
 		sum.clientFruitItemMap[msgBody.ClientId] = map[string]fruititem.FruitItem{}
 	}
@@ -134,73 +151,119 @@ func (sum *Sum) handleDataMessage(msgBody *inner.MessageBody) error {
 		}
 	}
 
-	sum.clientProcessedMsgCount[msgBody.ClientId]++
+	sum.clientNewMsg[msgBody.ClientId]++
+	coordinatorId, isParticipant := sum.clientCoordinatorId[msgBody.ClientId]
+	processed := sum.clientNewMsg[msgBody.ClientId]
+	if isParticipant {
+		sum.clientNewMsg[msgBody.ClientId] = 0
+	}
+	sum.stateLock.Unlock()
+
+	if isParticipant {
+		message := inner.CoordinationMessage{
+			Type:          inner.Count,
+			ClientId:      msgBody.ClientId,
+			CoordinatorId: coordinatorId,
+			Processed:     processed,
+		}
+		if err := sum.sendCoordMessageTo(coordinatorId, &message); err != nil {
+			slog.Error("While sending Count coordination message", "err", err)
+		}
+	}
+
 	return nil
 }
 
-func (sum *Sum) handleRingMessage(msg middleware.Message, ack func(), nack func()) {
+func (sum *Sum) handleCoordMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	ringMsg, err := inner.DeserializeRingMessage(&msg)
+	coordMsg, err := inner.DeserializeCoordinationMessage(&msg)
 	if err != nil {
-		slog.Error("While deserializing message", "err", err)
+		slog.Error("While deserializing coordination message", "err", err)
 		return
 	}
 
-	if ringMsg.IsFinal {
-		sum.handleRingFinalMessage(ringMsg)
+	// TODO: Ver que pasa cuando me llegan mensajes que YO mande, se tienen que descartar
+
+	if coordMsg.CoordinatorId == sum.id {
+		sum.coordinatorHandler(coordMsg)
 	} else {
-		sum.handeRingNonFinalMessage(ringMsg)
+		sum.participantHandler(coordMsg)
 	}
 
 	return
 }
 
-func (sum *Sum) handleRingFinalMessage(msg *inner.RingMessage) error {
-	slog.Info("Received Final ring message")
-
-	if err := sum.sendClientRecords(msg.ClientId); err != nil {
-		slog.Error("While sending records to Aggregation", "err", err)
-		return err
+func (sum *Sum) coordinatorHandler(msg *inner.CoordinationMessage) error {
+	if msg.Type != inner.Count {
+		return nil
 	}
 
-	if msg.CoordinatorId == sum.id {
-		if err := sum.sendEndOfTheRecordsMessage(msg.ClientId); err != nil {
-			slog.Error("While sending EOF to Aggregation", "err", err)
+	sum.stateLock.Lock()
+	_, ok := sum.clientRemainingMsg[msg.ClientId]
+	if !ok {
+		sum.stateLock.Unlock()
+		slog.Warn("Messages to process not found for this client", "clientId", msg.ClientId)
+		return nil
+	}
+	sum.clientRemainingMsg[msg.ClientId] -= msg.Processed
+	shouldEnd := sum.clientRemainingMsg[msg.ClientId] == 0
+	if shouldEnd {
+		delete(sum.clientRemainingMsg, msg.ClientId)
+	}
+	sum.stateLock.Unlock()
+
+	if shouldEnd {
+		message := inner.CoordinationMessage{
+			Type:          inner.End,
+			ClientId:      msg.ClientId,
+			CoordinatorId: sum.id,
+		}
+
+		if err := sum.sendCoordBroadcastMessage(&message); err != nil {
+			slog.Error("While sending End coordination message", "err", err)
 			return err
 		}
-	} else {
-		if err := sum.sendRingMessage(msg); err != nil {
-			slog.Error("While sending Final ring message", "err", err)
+	}
+	return nil
+}
+
+func (sum *Sum) participantHandler(msg *inner.CoordinationMessage) error {
+	if msg.Type == inner.Coordinator {
+		sum.stateLock.Lock()
+		sum.clientCoordinatorId[msg.ClientId] = msg.CoordinatorId
+		processed := sum.clientNewMsg[msg.ClientId]
+		sum.clientNewMsg[msg.ClientId] = 0
+		sum.stateLock.Unlock()
+
+		message := inner.CoordinationMessage{
+			Type:          inner.Count,
+			ClientId:      msg.ClientId,
+			Processed:     processed,
+			CoordinatorId: msg.CoordinatorId,
+		}
+
+		if err := sum.sendCoordMessageTo(msg.CoordinatorId, &message); err != nil {
+			slog.Error("While sending Count coordination message", "err", err)
+			return err
+		}
+	} else if msg.Type == inner.End {
+		sum.stateLock.Lock()
+		delete(sum.clientNewMsg, msg.ClientId)
+		delete(sum.clientCoordinatorId, msg.ClientId)
+		sum.stateLock.Unlock()
+
+		if err := sum.sendClientRecords(msg.ClientId); err != nil {
+			slog.Error("While sending client records", "err", err)
+			return err
+		}
+		if err := sum.sendEndOfTheRecordsMessage(msg.ClientId); err != nil {
+			slog.Error("While sending end of the-records message", "err", err)
 			return err
 		}
 	}
 
 	return nil
-}
-
-func (sum *Sum) handeRingNonFinalMessage(ringMsg *inner.RingMessage) {
-	processedCount := sum.clientProcessedMsgCount[ringMsg.ClientId]
-	ringMsg.Processed += processedCount
-	sum.clientProcessedMsgCount[ringMsg.ClientId] = 0
-
-	if ringMsg.Processed == ringMsg.Total {
-		ringMsg.IsFinal = true
-		ringMsg.CoordinatorId = sum.id
-	}
-
-	if err := sum.sendRingMessage(ringMsg); err != nil {
-		slog.Error("While sending ring message", "err", err)
-	}
-}
-
-func (sum *Sum) sendRingMessage(msg *inner.RingMessage) error {
-	message, err := inner.SerializeRingMessage(*msg)
-	if err != nil {
-		return err
-	}
-
-	return sum.ringOutputQueue.Send(*message)
 }
 
 func (sum *Sum) sendEndOfTheRecordsMessage(clientId uint64) error {
@@ -217,23 +280,62 @@ func (sum *Sum) sendEndOfTheRecordsMessage(clientId uint64) error {
 	return nil
 }
 
-func (sum *Sum) sendClientRecords(clientId uint64) error {
+func (sum *Sum) takeClientRecords(clientId uint64) []fruititem.FruitItem {
+	sum.stateLock.Lock()
+	defer sum.stateLock.Unlock()
+
 	fruitItemMap, ok := sum.clientFruitItemMap[clientId]
-	if ok {
-		for key := range fruitItemMap {
-			records := []fruititem.FruitItem{fruitItemMap[key]}
-			message, err := inner.SerializeMessage(inner.MessageBody{
-				ClientId: clientId,
-				Records:  records,
-			})
-			if err != nil {
-				return err
-			}
-			if err := sum.outputExchange.Send(*message); err != nil {
-				return err
-			}
+	if !ok {
+		return nil
+	}
+	delete(sum.clientFruitItemMap, clientId)
+
+	records := make([]fruititem.FruitItem, 0, len(fruitItemMap))
+	for _, item := range fruitItemMap {
+		records = append(records, item)
+	}
+	return records
+}
+
+func (sum *Sum) sendClientRecords(clientId uint64) error {
+	for _, record := range sum.takeClientRecords(clientId) {
+		message, err := inner.SerializeMessage(inner.MessageBody{
+			ClientId: clientId,
+			Records:  []fruititem.FruitItem{record},
+		})
+		if err != nil {
+			return err
 		}
-		delete(sum.clientFruitItemMap, clientId)
+		if err := sum.outputExchange.Send(*message); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (sum *Sum) sendCoordBroadcastMessage(msg *inner.CoordinationMessage) error {
+	message, err := inner.SerializeCoordinationMessage(*msg)
+	if err != nil {
+		return err
+	}
+
+	return sum.coordExchange.SendTo(coordBroadcastKey(), *message)
+}
+
+func (sum *Sum) sendCoordMessageTo(sumId int, msg *inner.CoordinationMessage) error {
+	message, err := inner.SerializeCoordinationMessage(*msg)
+	if err != nil {
+		return err
+	}
+
+	routingKey := coordRouteKey(sumId)
+	return sum.coordExchange.SendTo(routingKey, *message)
+}
+
+func coordRouteKey(id int) string {
+	return fmt.Sprintf("coord_%d", id)
+}
+
+func coordBroadcastKey() string {
+	return "coord_broadcast"
 }

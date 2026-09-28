@@ -22,7 +22,7 @@ func DeserializeMessage(message *middleware.Message) (*MessageBody, error) {
 	return body, nil
 }
 
-func SerializeRingMessage(msg RingMessage) (*middleware.Message, error) {
+func SerializeCoordinationMessage(msg CoordinationMessage) (*middleware.Message, error) {
 	jsonBody, err := msg.serializeJson()
 	if err != nil {
 		return nil, err
@@ -32,8 +32,8 @@ func SerializeRingMessage(msg RingMessage) (*middleware.Message, error) {
 	return &message, nil
 }
 
-func DeserializeRingMessage(message *middleware.Message) (*RingMessage, error) {
-	msg, err := deserializeJsonRing([]byte((*message).Body))
+func DeserializeCoordinationMessage(message *middleware.Message) (*CoordinationMessage, error) {
+	msg, err := deserializeJsonCoordination([]byte((*message).Body))
 	if err != nil {
 		return nil, err
 	}

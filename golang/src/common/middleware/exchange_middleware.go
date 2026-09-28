@@ -3,6 +3,7 @@ package middleware
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -13,10 +14,10 @@ type ExchangeMiddleware struct {
 	queue       *amqp.Queue
 	exchange    string
 	topics      []string
-	isConsuming bool
+	isConsuming atomic.Bool
 }
 
-func NewExchangeMiddleware(exchange string, keys []string, connectionSettings ConnSettings) (Middleware, error) {
+func NewExchangeMiddleware(exchange string, keys []string, connectionSettings ConnSettings) (Router, error) {
 	conn, err := amqp.Dial(fmt.Sprintf("amqp://%s:%d", connectionSettings.Hostname, connectionSettings.Port))
 	if err != nil {
 		return nil, err
@@ -65,13 +66,13 @@ func NewExchangeMiddleware(exchange string, keys []string, connectionSettings Co
 }
 
 func (em *ExchangeMiddleware) StartConsuming(callbackFunc func(msg Message, ack func(), nack func())) error {
+	defer func() { em.isConsuming.Store(false) }()
+	em.isConsuming.Store(true)
+
 	msgs, err := em.consume()
 	if err != nil {
 		return err
 	}
-
-	defer func() { em.isConsuming = false }()
-	em.isConsuming = true
 
 	for d := range msgs {
 		msg := Message{Body: string(d.Body)}
@@ -84,12 +85,11 @@ func (em *ExchangeMiddleware) StartConsuming(callbackFunc func(msg Message, ack 
 	if em.conn.IsClosed() {
 		return ErrMessageMiddlewareDisconnected
 	}
-
 	return nil
 }
 
 func (em *ExchangeMiddleware) StopConsuming() error {
-	if !em.isConsuming {
+	if !em.isConsuming.Load() {
 		return nil
 	}
 
@@ -111,6 +111,10 @@ func (em *ExchangeMiddleware) Send(msg Message) error {
 		}
 	}
 	return nil
+}
+
+func (em *ExchangeMiddleware) SendTo(topic string, msg Message) error {
+	return em.publish(msg, topic)
 }
 
 func (em *ExchangeMiddleware) Close() error {

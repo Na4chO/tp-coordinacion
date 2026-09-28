@@ -3,6 +3,7 @@ package middleware
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -11,7 +12,7 @@ type QueueMiddleware struct {
 	conn        *amqp.Connection
 	channel     *amqp.Channel
 	queue       amqp.Queue
-	isConsuming bool
+	isConsuming atomic.Bool
 }
 
 func NewQueueMiddleware(queueName string, connectionSettings ConnSettings) (Middleware, error) {
@@ -41,13 +42,13 @@ func NewQueueMiddleware(queueName string, connectionSettings ConnSettings) (Midd
 }
 
 func (qm *QueueMiddleware) StartConsuming(callbackFunc func(msg Message, ack func(), nack func())) error {
+	defer func() { qm.isConsuming.Store(false) }()
+	qm.isConsuming.Store(true)
+
 	msgs, err := qm.consume()
 	if err != nil {
 		return err
 	}
-
-	defer func() { qm.isConsuming = false }()
-	qm.isConsuming = true
 
 	for d := range msgs {
 		msg := Message{Body: string(d.Body)}
@@ -60,12 +61,11 @@ func (qm *QueueMiddleware) StartConsuming(callbackFunc func(msg Message, ack fun
 	if qm.conn.IsClosed() {
 		return ErrMessageMiddlewareDisconnected
 	}
-
 	return nil
 }
 
 func (qm *QueueMiddleware) StopConsuming() error {
-	if !qm.isConsuming {
+	if !qm.isConsuming.Load() {
 		return nil
 	}
 
