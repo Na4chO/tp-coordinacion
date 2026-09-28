@@ -24,13 +24,17 @@ type JoinConfig struct {
 	TopSize           int
 }
 
+type clientState struct {
+	finalTop         []fruititem.FruitItem
+	partialTopAmount int
+}
+
 type Join struct {
 	inputQueue               middleware.Middleware
 	outputQueue              middleware.Middleware
 	topSize                  int
-	clientFinalTop           map[uint64][]fruititem.FruitItem
 	expectedPartialTopAmount int
-	clientPartialTopAmount   map[uint64]int
+	clientStates             map[uint64]*clientState
 	running                  atomic.Bool
 }
 
@@ -52,9 +56,8 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		inputQueue:               inputQueue,
 		outputQueue:              outputQueue,
 		topSize:                  config.TopSize,
-		clientFinalTop:           map[uint64][]fruititem.FruitItem{},
 		expectedPartialTopAmount: config.AggregationAmount,
-		clientPartialTopAmount:   map[uint64]int{},
+		clientStates:             map[uint64]*clientState{},
 	}
 	join.running.Store(true)
 	return &join, nil
@@ -84,10 +87,11 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 		return err
 	}
 
-	join.updateCLientFinalTop(msgBody.ClientId, msgBody.Records)
+	state := join.clientStateFor(msgBody.ClientId)
+	join.updateClientFinalTop(state, msgBody.Records)
 
-	if join.clientPartialTopAmount[msgBody.ClientId] == join.expectedPartialTopAmount {
-		if err := join.sendClientFinalTop(msgBody.ClientId); err != nil {
+	if state.partialTopAmount == join.expectedPartialTopAmount {
+		if err := join.sendClientFinalTop(msgBody.ClientId, state); err != nil {
 			slog.Error("While sending final top", "err", err)
 			return err
 		}
@@ -95,42 +99,37 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 	return nil
 }
 
-func (join *Join) updateCLientFinalTop(clientId uint64, partialTop []fruititem.FruitItem) {
-	join.clientPartialTopAmount[clientId]++
-	actualTop, ok := join.clientFinalTop[clientId]
-	if !ok {
-		join.clientFinalTop[clientId] = partialTop
-		return
-	}
+func (join *Join) updateClientFinalTop(state *clientState, partialTop []fruititem.FruitItem) {
+	state.partialTopAmount++
 	if len(partialTop) == 0 {
 		return
 	}
 
-	newTop := make([]fruititem.FruitItem, min(join.topSize, len(actualTop)+len(partialTop)))
+	newTop := make([]fruititem.FruitItem, min(join.topSize, len(state.finalTop)+len(partialTop)))
 
 	i, j := 0, 0
-	for (i+j < join.topSize) && (i < len(actualTop) || j < len(partialTop)) {
+	for (i+j < join.topSize) && (i < len(state.finalTop) || j < len(partialTop)) {
 		switch {
 		case j >= len(partialTop):
-			newTop[i+j] = actualTop[i]
+			newTop[i+j] = state.finalTop[i]
 			i++
-		case i >= len(actualTop):
+		case i >= len(state.finalTop):
 			newTop[i+j] = partialTop[j]
 			j++
-		case actualTop[i].Less(partialTop[j]):
+		case state.finalTop[i].Less(partialTop[j]):
 			newTop[i+j] = partialTop[j]
 			j++
 		default:
-			newTop[i+j] = actualTop[i]
+			newTop[i+j] = state.finalTop[i]
 			i++
 		}
 	}
 
-	join.clientFinalTop[clientId] = newTop
+	state.finalTop = newTop
 }
 
-func (join *Join) sendClientFinalTop(clientId uint64) error {
-	finalTop, _ := join.clientFinalTop[clientId]
+func (join *Join) sendClientFinalTop(clientId uint64, state *clientState) error {
+	finalTop := state.finalTop
 	if finalTop == nil {
 		finalTop = []fruititem.FruitItem{}
 	}
@@ -146,9 +145,17 @@ func (join *Join) sendClientFinalTop(clientId uint64) error {
 		return err
 	}
 
-	delete(join.clientFinalTop, clientId)
-	delete(join.clientPartialTopAmount, clientId)
+	delete(join.clientStates, clientId)
 	return nil
+}
+
+func (join *Join) clientStateFor(clientId uint64) *clientState {
+	state, ok := join.clientStates[clientId]
+	if !ok {
+		state = &clientState{}
+		join.clientStates[clientId] = state
+	}
+	return state
 }
 
 func (join *Join) handleSignals() {

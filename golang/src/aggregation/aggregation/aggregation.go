@@ -26,14 +26,18 @@ type AggregationConfig struct {
 	TopSize           int
 }
 
+type clientState struct {
+	fruitItems map[string]fruititem.FruitItem
+	eofAmount  int
+}
+
 type Aggregation struct {
-	outputQueue        middleware.Middleware
-	inputExchange      middleware.Middleware
-	clientFruitItemMap map[uint64]map[string]fruititem.FruitItem
-	topSize            int
-	expectedEOFAmount  int
-	clientEOFAmount    map[uint64]int
-	running            atomic.Bool
+	outputQueue       middleware.Middleware
+	inputExchange     middleware.Middleware
+	clientStates      map[uint64]*clientState
+	topSize           int
+	expectedEOFAmount int
+	running           atomic.Bool
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -52,12 +56,11 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	}
 
 	aggregation := Aggregation{
-		outputQueue:        outputQueue,
-		inputExchange:      inputExchange,
-		clientFruitItemMap: map[uint64]map[string]fruititem.FruitItem{},
-		topSize:            config.TopSize,
-		expectedEOFAmount:  config.SumAmount,
-		clientEOFAmount:    map[uint64]int{},
+		outputQueue:       outputQueue,
+		inputExchange:     inputExchange,
+		clientStates:      map[uint64]*clientState{},
+		topSize:           config.TopSize,
+		expectedEOFAmount: config.SumAmount,
 	}
 	aggregation.running.Store(true)
 	return &aggregation, nil
@@ -99,14 +102,15 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 
 func (aggregation *Aggregation) handleEndOfRecordsMessage(msgBody *inner.MessageBody) error {
 	slog.Info("Received End Of Records message")
-	aggregation.clientEOFAmount[msgBody.ClientId]++
-	if aggregation.clientEOFAmount[msgBody.ClientId] < aggregation.expectedEOFAmount {
+
+	state := aggregation.clientStateFor(msgBody.ClientId)
+	state.eofAmount++
+	if state.eofAmount < aggregation.expectedEOFAmount {
 		return nil
 	}
 
-	fruitTopRecords := aggregation.buildFruitTop(msgBody.ClientId)
-	delete(aggregation.clientFruitItemMap, msgBody.ClientId)
-	delete(aggregation.clientEOFAmount, msgBody.ClientId)
+	fruitTopRecords := aggregation.buildFruitTop(state.fruitItems)
+	delete(aggregation.clientStates, msgBody.ClientId)
 
 	if err := aggregation.sendClientTop(msgBody.ClientId, fruitTopRecords); err != nil {
 		slog.Error("While sending top message", "err", err)
@@ -117,25 +121,18 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(msgBody *inner.Message
 }
 
 func (aggregation *Aggregation) handleDataMessage(msgBody *inner.MessageBody) {
-	if _, ok := aggregation.clientFruitItemMap[msgBody.ClientId]; !ok {
-		aggregation.clientFruitItemMap[msgBody.ClientId] = map[string]fruititem.FruitItem{}
-	}
+	state := aggregation.clientStateFor(msgBody.ClientId)
 
 	for _, fruitRecord := range msgBody.Records {
-		if _, ok := aggregation.clientFruitItemMap[msgBody.ClientId][fruitRecord.Fruit]; ok {
-			aggregation.clientFruitItemMap[msgBody.ClientId][fruitRecord.Fruit] = aggregation.clientFruitItemMap[msgBody.ClientId][fruitRecord.Fruit].Sum(fruitRecord)
+		if current, ok := state.fruitItems[fruitRecord.Fruit]; ok {
+			state.fruitItems[fruitRecord.Fruit] = current.Sum(fruitRecord)
 		} else {
-			aggregation.clientFruitItemMap[msgBody.ClientId][fruitRecord.Fruit] = fruitRecord
+			state.fruitItems[fruitRecord.Fruit] = fruitRecord
 		}
 	}
 }
 
-func (aggregation *Aggregation) buildFruitTop(clientId uint64) []fruititem.FruitItem {
-	fruitItemMap, ok := aggregation.clientFruitItemMap[clientId]
-	if !ok {
-		return []fruititem.FruitItem{}
-	}
-
+func (aggregation *Aggregation) buildFruitTop(fruitItemMap map[string]fruititem.FruitItem) []fruititem.FruitItem {
 	fruitItems := make([]fruititem.FruitItem, 0, len(fruitItemMap))
 	for _, item := range fruitItemMap {
 		fruitItems = append(fruitItems, item)
@@ -156,6 +153,15 @@ func (aggregation *Aggregation) sendClientTop(clientId uint64, fruitTopRecords [
 		return err
 	}
 	return aggregation.outputQueue.Send(*message)
+}
+
+func (aggregation *Aggregation) clientStateFor(clientId uint64) *clientState {
+	state, ok := aggregation.clientStates[clientId]
+	if !ok {
+		state = &clientState{fruitItems: map[string]fruititem.FruitItem{}}
+		aggregation.clientStates[clientId] = state
+	}
+	return state
 }
 
 func (aggregation *Aggregation) handleSignals() {
