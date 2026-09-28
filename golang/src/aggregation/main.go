@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+
+	"github.com/7574-sistemas-distribuidos/tp-coordinacion/aggregation"
 )
 
 func loadConfig() (aggregation.AggregationConfig, error) {
