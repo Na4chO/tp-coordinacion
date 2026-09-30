@@ -1,6 +1,8 @@
 package sum
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -105,11 +107,12 @@ func (sum *Sum) Run() error {
 
 	go sum.handleSignals()
 
-	err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleMessage(msg, ack, nack)
-	})
-
-	sum.closeMiddlewares()
+	err := errors.Join(
+		sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			sum.handleMessage(msg, ack, nack)
+		}),
+		sum.closeMiddlewares(),
+	)
 
 	if sum.running.Load() {
 		return err
@@ -243,7 +246,7 @@ func (sum *Sum) takeClientRecords(clientId uint64) []fruititem.FruitItem {
 func (sum *Sum) sendClientRecords(clientId uint64) error {
 	recordsByGroup := map[int][]fruititem.FruitItem{}
 	for _, record := range sum.takeClientRecords(clientId) {
-		group := fruitGroup(record.Fruit, sum.aggregationAmount)
+		group := clientFruitGroup(clientId, record.Fruit, sum.aggregationAmount)
 		recordsByGroup[group] = append(recordsByGroup[group], record)
 	}
 
@@ -261,9 +264,18 @@ func (sum *Sum) sendClientRecords(clientId uint64) error {
 	return nil
 }
 
-func fruitGroup(fruit string, groups int) int {
+func clientFruitGroup(clientId uint64, fruit string, groups int) int {
+	if groups < 1 {
+		return 0
+	}
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(fruit))
+
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, clientId)
+	key = append(key, fruit...)
+
+	_, _ = h.Write(key)
+
 	return int(h.Sum64() % uint64(groups))
 }
 
@@ -286,10 +298,12 @@ func (sum *Sum) handleSignals() {
 	_ = sum.coordExchange.StopConsuming()
 }
 
-func (sum *Sum) closeMiddlewares() {
-	_ = sum.inputQueue.StopConsuming()
-	_ = sum.inputQueue.Close()
-	_ = sum.coordExchange.StopConsuming()
-	_ = sum.coordExchange.Close()
-	_ = sum.outputExchange.Close()
+func (sum *Sum) closeMiddlewares() error {
+	return errors.Join(
+		sum.inputQueue.StopConsuming(),
+		sum.inputQueue.Close(),
+		sum.coordExchange.StopConsuming(),
+		sum.coordExchange.Close(),
+		sum.outputExchange.Close(),
+	)
 }

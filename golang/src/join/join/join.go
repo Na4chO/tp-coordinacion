@@ -1,6 +1,7 @@
 package join
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -66,11 +67,12 @@ func NewJoin(config JoinConfig) (*Join, error) {
 func (join *Join) Run() error {
 	go join.handleSignals()
 
-	err := join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		join.handleMessage(msg, ack, nack)
-	})
-
-	join.closeMiddlewares()
+	err := errors.Join(
+		join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			join.handleMessage(msg, ack, nack)
+		}),
+		join.closeMiddlewares(),
+	)
 
 	if join.running.Load() {
 		return err
@@ -78,13 +80,13 @@ func (join *Join) Run() error {
 	return nil
 }
 
-func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) error {
+func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
 	msgBody, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
-		return err
+		return
 	}
 
 	state := join.clientStateFor(msgBody.ClientId)
@@ -93,10 +95,10 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 	if state.partialTopAmount == join.expectedPartialTopAmount {
 		if err := join.sendClientFinalTop(msgBody.ClientId, state); err != nil {
 			slog.Error("While sending final top", "err", err)
-			return err
+			return
 		}
 	}
-	return nil
+	return
 }
 
 func (join *Join) updateClientFinalTop(state *clientState, partialTop []fruititem.FruitItem) {
@@ -167,8 +169,10 @@ func (join *Join) handleSignals() {
 	_ = join.inputQueue.StopConsuming()
 }
 
-func (join *Join) closeMiddlewares() {
-	_ = join.inputQueue.StopConsuming()
-	_ = join.inputQueue.Close()
-	_ = join.outputQueue.Close()
+func (join *Join) closeMiddlewares() error {
+	return errors.Join(
+		join.inputQueue.StopConsuming(),
+		join.inputQueue.Close(),
+		join.outputQueue.Close(),
+	)
 }

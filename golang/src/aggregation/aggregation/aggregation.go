@@ -1,6 +1,7 @@
 package aggregation
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -69,11 +70,12 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 func (aggregation *Aggregation) Run() error {
 	go aggregation.handleSignals()
 
-	err := aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		aggregation.handleMessage(msg, ack, nack)
-	})
-
-	aggregation.closeMiddlewares()
+	err := errors.Join(
+		aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			aggregation.handleMessage(msg, ack, nack)
+		}),
+		aggregation.closeMiddlewares(),
+	)
 
 	if aggregation.running.Load() {
 		return err
@@ -173,8 +175,10 @@ func (aggregation *Aggregation) handleSignals() {
 	_ = aggregation.inputExchange.StopConsuming()
 }
 
-func (aggregation *Aggregation) closeMiddlewares() {
-	_ = aggregation.inputExchange.StopConsuming()
-	_ = aggregation.inputExchange.Close()
-	_ = aggregation.outputQueue.Close()
+func (aggregation *Aggregation) closeMiddlewares() error {
+	return errors.Join(
+		aggregation.inputExchange.StopConsuming(),
+		aggregation.inputExchange.Close(),
+		aggregation.outputQueue.Close(),
+	)
 }
