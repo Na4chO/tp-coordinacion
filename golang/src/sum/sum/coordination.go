@@ -18,9 +18,13 @@ func (sum *Sum) handleCoordMessage(msg middleware.Message, ack func(), nack func
 	}
 
 	if coordMsg.CoordinatorId == sum.id {
-		sum.coordinatorHandler(coordMsg)
+		err = sum.coordinatorHandler(coordMsg)
 	} else {
-		sum.participantHandler(coordMsg)
+		err = sum.participantHandler(coordMsg)
+	}
+
+	if err != nil {
+		slog.Error("While handling coordination message", "err", err)
 	}
 
 	return

@@ -65,7 +65,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 
 	outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
 	if err != nil {
-		inputQueue.Close()
+		_ = inputQueue.Close()
 		return nil, err
 	}
 
@@ -76,8 +76,8 @@ func NewSum(config SumConfig) (*Sum, error) {
 		connSettings,
 	)
 	if err != nil {
-		inputQueue.Close()
-		outputExchange.Close()
+		_ = inputQueue.Close()
+		_ = outputExchange.Close()
 		return nil, err
 	}
 

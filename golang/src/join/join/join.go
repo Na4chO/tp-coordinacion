@@ -49,7 +49,7 @@ func NewJoin(config JoinConfig) (*Join, error) {
 
 	outputQueue, err := middleware.CreateQueueMiddleware(config.OutputQueue, connSettings)
 	if err != nil {
-		inputQueue.Close()
+		_ = inputQueue.Close()
 		return nil, err
 	}
 
